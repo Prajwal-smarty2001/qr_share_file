@@ -1,92 +1,48 @@
-import streamlit as st
-import time
-import base64
+import base64, json, zlib, uuid, hashlib
+import qrcode
 from pathlib import Path
-from qr_codec import prepare_file_for_transfer, generate_qr_pngs
-from storage import TransferStore
 
-BASE = Path("runtime")
-UPLOAD = BASE / "uploads"
-SHARE = BASE / "frames"
-RECV = BASE / "received"
+def prepare_file_for_transfer(path: Path):
+    raw = path.read_bytes()
 
-for p in [UPLOAD, SHARE, RECV]:
-    p.mkdir(parents=True, exist_ok=True)
+    compressed = zlib.compress(raw)
+    data = compressed if len(compressed) < len(raw) else raw
 
-store = TransferStore(RECV)
+    b64 = base64.b64encode(data).decode()
 
-st.set_page_config(layout="wide")
+    chunk_size = 1400  # optimized
+    chunks = [b64[i:i+chunk_size] for i in range(0, len(b64), chunk_size)]
 
-mode = st.radio("Select Mode", ["Share", "Receive"])
+    sid = uuid.uuid4().hex[:10]
 
-# ---------------- SHARE ----------------
-if mode == "Share":
-    st.title("📤 QR Share")
+    sha = hashlib.sha256(raw).hexdigest()
 
-    uploaded = st.file_uploader("Upload file")
+    payloads = [json.dumps({
+        "t": "meta",
+        "sid": sid,
+        "total": len(chunks),
+        "name": path.name,
+        "sha": sha
+    })]
 
-    if uploaded:
-        file_path = UPLOAD / uploaded.name
-        with open(file_path, "wb") as f:
-            f.write(uploaded.getbuffer())
+    for i, chunk in enumerate(chunks):
+        payloads.append(json.dumps({
+            "t": "chunk",
+            "sid": sid,
+            "i": i,
+            "data": chunk
+        }))
 
-        st.success("File uploaded")
+    return {"payloads": payloads}
 
-        if st.button("Generate + Play QR"):
-            for f in SHARE.glob("*.png"):
-                f.unlink()
+def generate_qr_pngs(payloads, out: Path):
+    out.mkdir(exist_ok=True)
 
-            data = prepare_file_for_transfer(file_path)
-            frames = generate_qr_pngs(data["payloads"], SHARE)
+    paths = []
+    for i, p in enumerate(payloads):
+        img = qrcode.make(p)
+        file = out / f"{i}.png"
+        img.save(file)
+        paths.append(file)
 
-            st.success(f"{len(frames)} QR frames created")
-
-            placeholder = st.empty()
-
-            # autoplay loop
-            while True:
-                for img in frames:
-                    placeholder.image(str(img), width=400)
-                    time.sleep(0.15)
-
-# ---------------- RECEIVE ----------------
-elif mode == "Receive":
-    st.title("📥 QR Receiver")
-
-    st.components.v1.html("""
-    <script src="https://unpkg.com/html5-qrcode"></script>
-
-    <div id="reader" style="width:300px"></div>
-    <p id="status">Scanning...</p>
-
-    <script>
-    const qr = new Html5Qrcode("reader");
-
-    function onScanSuccess(decodedText) {
-        fetch("/qr", {
-            method: "POST",
-            headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({text: decodedText})
-        }).then(r => r.json()).then(d => {
-            document.getElementById("status").innerText =
-                `Received: ${d.received}/${d.total}`;
-        });
-    }
-
-    qr.start(
-        { facingMode: "environment" },
-        { fps: 10, qrbox: 250 },
-        onScanSuccess
-    );
-    </script>
-    """, height=400)
-
-    st.info("After full scan, download will appear below")
-
-    sid = st.text_input("Session ID")
-
-    if st.button("Download File"):
-        file = store.get_file(sid)
-        if file:
-            with open(file, "rb") as f:
-                st.download_button("Download", f, file.name)
+    return paths
